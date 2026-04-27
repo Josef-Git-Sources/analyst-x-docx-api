@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
@@ -6,11 +6,14 @@ from docx import Document
 import re
 from datetime import datetime
 from pathlib import Path
+import os
 
 app = FastAPI(title="Analyst-X DOCX Export API")
 
 REPORT_DIR = Path("/tmp/reports")
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+API_KEY = os.getenv("ANALYST_X_API_KEY")
 
 
 class Section(BaseModel):
@@ -44,9 +47,23 @@ class ExportRequest(BaseModel):
     report: Report
 
 
+def check_api_key(request: Request):
+    if not API_KEY:
+        return
+    provided_key = request.headers.get("x-api-key")
+    if provided_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
 def safe_filename(name: str) -> str:
     name = re.sub(r"[^\w\-.]+", "_", name, flags=re.UNICODE)
     return name.strip("_")
+
+
+def clean_part(value: str) -> str:
+    value = value or "Unknown"
+    value = value.replace(" ", "_")
+    return safe_filename(value)
 
 
 def add_table(doc: Document, columns: List[str], rows: List[List[str]]):
@@ -72,12 +89,15 @@ def validate_report(report: Report):
         if section.type not in ["paragraphs", "table"]:
             raise HTTPException(status_code=400, detail=f"Invalid type in section {section.number}")
 
-        if section.type == "paragraphs" and section.content is None:
-            raise HTTPException(status_code=400, detail=f"Missing content in section {section.number}")
+        if section.type == "paragraphs":
+            if section.content is None or len(section.content) == 0:
+                raise HTTPException(status_code=400, detail=f"Missing content in section {section.number}")
 
         if section.type == "table":
-            if not section.columns or not section.rows:
-                raise HTTPException(status_code=400, detail=f"Missing table data in section {section.number}")
+            if not section.columns:
+                raise HTTPException(status_code=400, detail=f"Missing table columns in section {section.number}")
+            if not section.rows or len(section.rows) == 0:
+                raise HTTPException(status_code=400, detail=f"Table in section {section.number} must have at least one row")
 
             source_index = len(section.columns) - 1
             for row_i, row in enumerate(section.rows):
@@ -94,16 +114,25 @@ def root():
 
 
 @app.post("/generate-docx")
-def generate_docx(payload: ExportRequest):
+def generate_docx(payload: ExportRequest, request: Request):
+    check_api_key(request)
+
+    print("Incoming request for:", payload.report.metadata.company_name)
+
     validate_report(payload.report)
     meta = payload.report.metadata
 
     report_time = meta.time if meta.time and meta.time.strip() not in ["—", "-", ""] else datetime.now().strftime("%H-%M")
     report_time = report_time.replace(":", "-")
 
-    file_name = payload.file_name or f"{meta.company_name}_{meta.date}_{report_time}.docx"
-    file_name = safe_filename(file_name)
+    if payload.file_name:
+        file_name = payload.file_name
+    else:
+        company = clean_part(meta.company_name)
+        goal = clean_part(meta.research_goal)
+        file_name = f"{company}_{goal}_{meta.date}_{report_time}.docx"
 
+    file_name = safe_filename(file_name)
     if not file_name.endswith(".docx"):
         file_name += ".docx"
 
